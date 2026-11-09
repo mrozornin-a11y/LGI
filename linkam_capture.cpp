@@ -21,7 +21,7 @@
 #include <cwctype>
 #include <strsafe.h>
 
-static const wchar_t *TITLE = L"Съёмка ГЖВ · 1.2";
+static const wchar_t *TITLE = L"Съёмка ГЖВ · 1.3";
 static const wchar_t *MAIN_CLASS = L"LinkamCaptureMain";
 static const wchar_t *SELECT_CLASS = L"LinkamCaptureSelection";
 static const wchar_t *REVIEW_CLASS = L"LinkamCaptureReview";
@@ -30,10 +30,10 @@ static const CLSID PNG_ENCODER = {0x557cf406, 0x1a04, 0x11d3, {0x9a, 0x73, 0, 0,
 static const CLSID JPEG_ENCODER = {0x557cf401, 0x1a04, 0x11d3, {0x9a, 0x73, 0, 0, 0xf8, 0x1e, 0xf3, 0x2e}};
 static const GUID QUALITY_PARAMETER = {0x1d5be4b5, 0xfa4a, 0x452d, {0x9c, 0xdd, 0x5d, 0xb3, 0x51, 0x05, 0xe7, 0xeb}};
 static const UINT_PTR START_TIMER = 1, CAPTURE_TIMER = 2, SELECT_TIMER = 3;
-static const int STOP_HOTKEY = 1;
+static const int STOP_HOTKEY = 1, PAUSE_HOTKEY = 2;
 static const unsigned SAMPLE_LIMIT = 60, INCLUSION_LIMIT = 20, MAX_RATE = 30;
 enum Control { REGION = 100, FOLDER, START, STOP, REVIEW, LAST, INTERVAL, RATE, MODE_FRAMES, MODE_VIDEO,
-               PREV, NEXT, FRAME_SLIDER, EXPORT_FRAME, CLOSE_REVIEW, SAMPLE_BOX, INCLUSION_BOX };
+               PREV, NEXT, FRAME_SLIDER, EXPORT_FRAME, CLOSE_REVIEW, SAMPLE_BOX, INCLUSION_BOX, PAUSE };
 
 struct Frame {
     unsigned number;            // номер кадра в журнале или в AVI, с единицы
@@ -42,6 +42,7 @@ struct Frame {
     unsigned long long offset;  // видео: положение данных JPEG в AVI
     DWORD size;
     bool repeated;              // видео: кадр повторяет предыдущий, новый снимок не успел
+    DWORD pause;                // длительность паузы перед этим кадром, мс
 };
 
 // AVI с MJPEG в формате OpenDML: первый RIFF совместим с AVI 1.0 (idx1),
@@ -59,7 +60,7 @@ struct Avi {
 
 static HINSTANCE instance;
 static HWND main_window, status_label, folder_label, region_button, folder_button;
-static HWND start_button, stop_button, interval_box, rate_box, frames_radio, video_radio;
+static HWND start_button, pause_button, stop_button, interval_box, rate_box, frames_radio, video_radio;
 static HWND review_button, last_button;
 static HWND review_window, frame_slider, frame_label, previous_button, next_button, export_button;
 static HWND sample_box, inclusion_box, preview_label;
@@ -68,8 +69,8 @@ static wchar_t root[MAX_PATH], last_folder[MAX_PATH], series_folder[MAX_PATH], i
 static wchar_t series_name[MAX_PATH], file_prefix[MAX_PATH], journal_path[MAX_PATH], video_path[MAX_PATH];
 static wchar_t sample[SAMPLE_LIMIT + 1], inclusion[INCLUSION_LIMIT + 1];
 static FILE *journal;
-static bool recording, hotkey_registered, dragging, changing_selection, video_mode, capture_video, fine_timer;
-static DWORD first_ms, delay_ms, shown_second;
+static bool recording, paused, pause_open, pause_hotkey_registered, hotkey_registered, dragging, changing_selection, video_mode, capture_video, fine_timer;
+static DWORD first_ms, delay_ms, shown_second, pause_started, paused_total, hidden_since;
 static unsigned written, rate, last_slot, repeats;
 static int experiment_answer;
 static ULONG jpeg_quality = 90;
@@ -225,6 +226,8 @@ static void update_controls() {
     EnableWindow(rate_box, !recording && video_mode);
     EnableWindow(start_button, !recording);
     EnableWindow(stop_button, recording);
+    EnableWindow(pause_button, recording);
+    SetWindowTextW(pause_button, paused ? L"Продолжить" : L"Пауза");
     EnableWindow(review_button, !recording);
     EnableWindow(last_button, !recording && last_folder[0] && folder_exists(last_folder));
 }
@@ -776,6 +779,12 @@ static bool write_utf8(FILE *file, const wchar_t *text) {
         && fputs(buffer, file) != EOF;
 }
 
+static const wchar_t *hotkey_hint() {
+    if (hotkey_registered && pause_hotkey_registered) return L"Пауза — Ctrl+Shift+F8, остановка — Ctrl+Shift+F9.";
+    if (hotkey_registered) return L"Остановка — Ctrl+Shift+F9. Для паузы откройте окно с панели задач.";
+    return L"Для паузы или остановки откройте окно с панели задач.";
+}
+
 static void show_progress(DWORD elapsed) {
     if (elapsed / 1000 == shown_second && written > 1) return;
     shown_second = elapsed / 1000;
@@ -784,7 +793,7 @@ static void show_progress(DWORD elapsed) {
                      (unsigned long)(elapsed / 60000 % 60), (unsigned long)(elapsed / 1000 % 60));
     StringCchPrintfW(title, 120, L"Запись %s — %s", time, TITLE);
     SetWindowTextW(main_window, title);
-    const wchar_t *stop = hotkey_registered ? L"Остановка — Ctrl+Shift+F9." : L"Для остановки откройте окно с панели задач.";
+    const wchar_t *stop = hotkey_hint();
     if (capture_video)
         StringCchPrintfW(label, 200, L"Идёт видеозапись %s. Кадров в файле: %u, из них повторов: %u.\n%s",
                          time, avi.total, repeats, stop);
@@ -824,7 +833,7 @@ static void stop_capture(const wchar_t *error = NULL) {
     journal = NULL;
     if (fine_timer) timeEndPeriod(1);
     fine_timer = false;
-    recording = false;
+    recording = paused = pause_open = false;
     if (written) save_settings();
     else remove_empty_series();
     SetWindowTextW(main_window, TITLE);
@@ -925,7 +934,12 @@ static bool journal_time(const SYSTEMTIME &now) {
 // Если снимок не успел к своему месту, пропущенные места заполняются предыдущим кадром,
 // поэтому длительность AVI совпадает с реальным временем записи.
 static bool video_tick(wchar_t (&error)[192]) {
-    if (!IsIconic(main_window)) return true;
+    if (paused || pause_open) return true;
+    if (!IsIconic(main_window)) {  // окно развёрнуто: запомнить когда, на случай паузы кнопкой
+        if (!hidden_since) hidden_since = timeGetTime() | 1;
+        return true;
+    }
+    hidden_since = 0;
     if (!region_valid(region)) {
         StringCchCopyW(error, 192, L"Размер экрана изменился. Выделите область заново.");
         return false;
@@ -933,7 +947,7 @@ static bool video_tick(wchar_t (&error)[192]) {
     const DWORD now = timeGetTime();
     unsigned slot = 0;
     if (written) {
-        slot = (unsigned)((unsigned long long)(DWORD)(now - first_ms) * rate / 1000);
+        slot = (unsigned)((unsigned long long)(DWORD)(now - first_ms - paused_total) * rate / 1000);
         if (slot <= last_slot) return true;
     }
     SYSTEMTIME local;
@@ -1053,6 +1067,8 @@ static void begin_capture() {
     capture_video = video_mode;
     journal_path[0] = video_path[0] = 0;
     written = repeats = last_slot = 0;
+    paused = pause_open = false;
+    paused_total = hidden_since = 0;
     shown_second = 0;
     path_in(journal_path, series_folder, capture_video ? L"video.csv" : L"frames.csv");
     if (capture_video) {
@@ -1089,6 +1105,60 @@ static void begin_capture() {
     recording = true;
     update_controls();
     SetWindowTextW(status_label, L"Съёмка начнётся через 2 секунды.");
+    ShowWindow(main_window, SW_MINIMIZE);
+    if (!SetTimer(main_window, START_TIMER, 2000, NULL)) stop_capture(L"Не удалось запустить таймер.");
+}
+
+// Пауза: таймеры останавливаются, папка, журнал и видеофайл остаются открытыми.
+// Время в именах PNG и в колонке elapsed_ms — реальное от первого кадра (пауза видна
+// как скачок), а из видео пауза вырезается: после неё кадры идут подряд.
+static void pause_capture() {
+    if (!recording || paused) return;
+    KillTimer(main_window, START_TIMER);
+    KillTimer(main_window, CAPTURE_TIMER);
+    paused = true;
+    if (!pause_open) {
+        // Пауза кнопкой: время с момента разворота окна тоже считается паузой, а не повторами.
+        pause_started = capture_video && hidden_since ? hidden_since : timeGetTime();
+        pause_open = true;
+    }
+    wchar_t title[120], label[300];
+    StringCchPrintfW(title, 120, L"Пауза — %s", TITLE);
+    SetWindowTextW(main_window, title);
+    StringCchPrintfW(label, 300, L"Пауза. %s: %u. Запись продолжится в %s.\nПродолжить — кнопка «Продолжить»%s.",
+        capture_video ? L"Кадров в видео" : L"Снято кадров", capture_video ? avi.total : written,
+        capture_video ? L"тот же видеофайл" : L"ту же папку", pause_hotkey_registered ? L" или Ctrl+Shift+F8" : L"");
+    SetWindowTextW(status_label, label);
+    update_controls();
+}
+
+// Запуск таймеров съёмки: после начальной задержки и после паузы.
+static void run_capture() {
+    KillTimer(main_window, START_TIMER);
+    if (pause_open) {
+        if (written) paused_total += timeGetTime() - pause_started;
+        pause_open = false;
+        shown_second = (DWORD)-1;
+        hidden_since = 0;
+    }
+    const UINT tick = capture_video ? std::max(10u, 1000 / rate / 8) : delay_ms;
+    if (!SetTimer(main_window, CAPTURE_TIMER, tick, NULL))
+        stop_capture(L"Не удалось запустить интервальную съёмку.");
+    else if (capture_video) {
+        wchar_t error[192] = {};
+        if (!video_tick(error)) stop_capture(error);
+    } else capture_frame();
+}
+
+static void resume_capture() {
+    if (!recording || !paused) return;
+    paused = false;
+    update_controls();
+    if (IsIconic(main_window)) {  // продолжение горячей клавишей из свёрнутого окна
+        run_capture();
+        return;
+    }
+    SetWindowTextW(status_label, L"Съёмка продолжится через 2 секунды.");
     ShowWindow(main_window, SW_MINIMIZE);
     if (!SetTimer(main_window, START_TIMER, 2000, NULL)) stop_capture(L"Не удалось запустить таймер.");
 }
@@ -1147,11 +1217,15 @@ static void set_review_frame(unsigned index) {
     frame_index = index;
     release_review_image();
     load_review_image(frames[index]);
-    wchar_t label[200], time[20];
+    wchar_t label[240], time[20], note[80] = L"";
     format_time(time, 20, frames[index].elapsed, false);
-    StringCchPrintfW(label, 200, L"Кадр %u из %u   ·   %s от начала%s", index + 1, frame_count, time,
-        !review_image ? L"   ·   кадр недоступен"
-        : frames[index].repeated ? L"   ·   повтор предыдущего кадра" : L"");
+    const DWORD pause = (frames[index].pause + 500) / 1000;
+    if (!review_image) StringCchCopyW(note, 80, L"   ·   кадр недоступен");
+    else if (frames[index].repeated) StringCchCopyW(note, 80, L"   ·   повтор предыдущего кадра");
+    else if (frames[index].pause)
+        StringCchPrintfW(note, 80, L"   ·   после паузы %02lu:%02lu:%02lu", (unsigned long)(pause / 3600),
+                         (unsigned long)(pause / 60 % 60), (unsigned long)(pause % 60));
+    StringCchPrintfW(label, 240, L"Кадр %u из %u   ·   %s от начала%s", index + 1, frame_count, time, note);
     SetWindowTextW(frame_label, label);
     SendMessageW(frame_slider, TBM_SETPOS, TRUE, index);
     EnableWindow(previous_button, index > 0);
@@ -1305,6 +1379,17 @@ static bool load_png_series(FILE *input) {
             return false;
         }
     }
+    // Паузы: промежуток заметно длиннее обычного интервала между кадрами.
+    DWORD step = 0;
+    for (unsigned i = 1; i < frame_count; ++i) {
+        const DWORD gap = frames[i].elapsed - frames[i - 1].elapsed;
+        if (gap && (!step || gap < step)) step = gap;
+    }
+    for (unsigned i = 1; step && i < frame_count; ++i) {
+        const DWORD gap = frames[i].elapsed - frames[i - 1].elapsed;
+        if (frames[i].elapsed > frames[i - 1].elapsed && gap >= 2 * step && gap - step >= 1000)
+            frames[i].pause = gap - step;
+    }
     return true;
 }
 
@@ -1364,12 +1449,21 @@ static void load_video_times(const wchar_t *folder) {
     if (!input) return;
     for (unsigned i = 0; i < frame_count; ++i) frames[i].repeated = true;
     char line[256];
+    long long previous = 0;
+    bool seen = false;
     while (fgets(line, sizeof(line), input)) {
         unsigned number = 0;
-        unsigned long elapsed = 0;
-        if (sscanf(line, "%u,%lu,", &number, &elapsed) == 2 && number && number <= frame_count) {
+        unsigned long elapsed = 0, video_ms = 0;
+        const int got = sscanf(line, "%u,%lu,%*[^,],%lu", &number, &elapsed, &video_ms);
+        if (got >= 2 && number && number <= frame_count) {
             frames[number - 1].elapsed = elapsed;
             frames[number - 1].repeated = false;
+            if (got == 3) {  // пауза: реальное время ушло вперёд сильнее, чем время в видео
+                const long long offset = (long long)elapsed - (long long)video_ms;
+                if (seen && offset - previous >= 1000) frames[number - 1].pause = (DWORD)(offset - previous);
+                previous = offset;
+                seen = true;
+            }
         }
     }
     fclose(input);
@@ -1491,15 +1585,16 @@ static LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM w, LPARAM l)
         control(window, L"STATIC", L"кадр/с", 0, 462, 104, 90, 20);
         SendMessageW(interval_box, EM_SETLIMITTEXT, 2, 0);
         SendMessageW(rate_box, EM_SETLIMITTEXT, 2, 0);
-        start_button = control(window, L"BUTTON", L"Начать съёмку", WS_TABSTOP | WS_GROUP, 15, 141, 145, 33, START);
-        stop_button = control(window, L"BUTTON", L"Остановить", WS_TABSTOP, 170, 141, 125, 33, STOP);
-        last_button = control(window, L"BUTTON", L"Последняя серия", WS_TABSTOP, 305, 141, 132, 33, LAST);
-        review_button = control(window, L"BUTTON", L"Открыть серию…", WS_TABSTOP, 447, 141, 133, 33, REVIEW);
+        start_button = control(window, L"BUTTON", L"Начать съёмку", WS_TABSTOP | WS_GROUP, 15, 141, 115, 33, START);
+        pause_button = control(window, L"BUTTON", L"Пауза", WS_TABSTOP, 136, 141, 105, 33, PAUSE);
+        stop_button = control(window, L"BUTTON", L"Остановить", WS_TABSTOP, 247, 141, 100, 33, STOP);
+        last_button = control(window, L"BUTTON", L"Последняя серия", WS_TABSTOP, 353, 141, 112, 33, LAST);
+        review_button = control(window, L"BUTTON", L"Открыть серию…", WS_TABSTOP, 471, 141, 109, 33, REVIEW);
         control(window, L"STATIC", L"На экране оставьте открытыми изображение и температуру.", 0, 15, 188, 565, 20);
         status_label = control(window, L"STATIC", L"", SS_NOPREFIX, 15, 212, 565, 40);
         hotkey_registered = RegisterHotKey(window, STOP_HOTKEY, MOD_CONTROL | MOD_SHIFT, VK_F9) != FALSE;
-        SetWindowTextW(status_label, hotkey_registered ? L"Остановка съёмки — Ctrl+Shift+F9." :
-            L"Для остановки разверните окно с панели задач и нажмите «Остановить».");
+        pause_hotkey_registered = RegisterHotKey(window, PAUSE_HOTKEY, MOD_CONTROL | MOD_SHIFT, VK_F8) != FALSE;
+        SetWindowTextW(status_label, hotkey_hint());
         load_settings();
         update_controls();
         return 0;
@@ -1531,6 +1626,10 @@ static LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM w, LPARAM l)
             break;
         case START: if (!recording) begin_capture(); break;
         case STOP: if (recording) stop_capture(); break;
+        case PAUSE:
+            if (recording && paused) resume_capture();
+            else if (recording) pause_capture();
+            break;
         case LAST: if (!recording) open_series(last_folder); break;
         case REVIEW: {
             wchar_t selected[MAX_PATH];
@@ -1544,16 +1643,9 @@ static LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM w, LPARAM l)
         if (w == SELECT_TIMER) {
             KillTimer(window, SELECT_TIMER);
             show_selection();
-        } else if (recording && w == START_TIMER) {
-            KillTimer(window, START_TIMER);
-            const UINT tick = capture_video ? std::max(10u, 1000 / rate / 8) : delay_ms;
-            if (!SetTimer(window, CAPTURE_TIMER, tick, NULL))
-                stop_capture(L"Не удалось запустить интервальную съёмку.");
-            else if (capture_video) {
-                wchar_t error[192] = {};
-                if (!video_tick(error)) stop_capture(error);
-            } else capture_frame();
-        } else if (recording && w == CAPTURE_TIMER) {
+        } else if (recording && !paused && w == START_TIMER) {
+            run_capture();
+        } else if (recording && !paused && w == CAPTURE_TIMER) {
             if (capture_video) {
                 wchar_t error[192] = {};
                 if (!video_tick(error)) stop_capture(error);
@@ -1562,6 +1654,8 @@ static LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM w, LPARAM l)
         return 0;
     case WM_HOTKEY:
         if (recording && w == STOP_HOTKEY) stop_capture();
+        else if (recording && w == PAUSE_HOTKEY && paused) resume_capture();
+        else if (recording && w == PAUSE_HOTKEY) pause_capture();
         return 0;
     case WM_ENDSESSION:
         if (w && recording) stop_capture();
@@ -1573,6 +1667,7 @@ static LRESULT CALLBACK main_proc(HWND window, UINT message, WPARAM w, LPARAM l)
         return 0;
     case WM_DESTROY:
         if (hotkey_registered) UnregisterHotKey(window, STOP_HOTKEY);
+        if (pause_hotkey_registered) UnregisterHotKey(window, PAUSE_HOTKEY);
         PostQuitMessage(0);
         return 0;
     }
